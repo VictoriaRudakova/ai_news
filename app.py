@@ -1,52 +1,53 @@
 import os
 import html
+import traceback
 import requests
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-# ===== ENV VARS =====
-NEWS_API_KEY = os.environ.get("NEWS_API_KEY", "")
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
-RUN_SECRET = os.environ.get("RUN_SECRET", "")
-
 NEWS_API_URL = "https://newsapi.org/v2/everything"
-TELEGRAM_SEND_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
 
 
-def validate_env():
-    missing = []
-
-    if not NEWS_API_KEY:
-        missing.append("NEWS_API_KEY")
-    if not TELEGRAM_BOT_TOKEN:
-        missing.append("TELEGRAM_BOT_TOKEN")
-    if not TELEGRAM_CHAT_ID:
-        missing.append("TELEGRAM_CHAT_ID")
-    if not RUN_SECRET:
-        missing.append("RUN_SECRET")
-
-    if missing:
-        raise RuntimeError(f"Missing environment variables: {', '.join(missing)}")
+def get_env(name: str, required: bool = True) -> str:
+    value = os.environ.get(name, "").strip()
+    if required and not value:
+        raise RuntimeError(f"Missing environment variable: {name}")
+    return value
 
 
-def fetch_ai_news():
+def get_config():
+    return {
+        "NEWS_API_KEY": get_env("NEWS_API_KEY"),
+        "TELEGRAM_BOT_TOKEN": get_env("TELEGRAM_BOT_TOKEN"),
+        "TELEGRAM_CHAT_ID": get_env("TELEGRAM_CHAT_ID"),
+        "RUN_SECRET": get_env("RUN_SECRET"),
+    }
+
+
+def fetch_ai_news(news_api_key: str) -> list[dict]:
     params = {
         "q": '(AI OR "artificial intelligence" OR OpenAI OR Anthropic OR Gemini OR LLM OR "machine learning")',
         "sortBy": "publishedAt",
         "pageSize": 10,
-        "apiKey": NEWS_API_KEY,
+        "apiKey": news_api_key,
     }
 
     response = requests.get(NEWS_API_URL, params=params, timeout=30)
-    response.raise_for_status()
 
-    data = response.json()
-    print("NEWSAPI RAW RESPONSE:", data)
+    try:
+        data = response.json()
+    except Exception:
+        data = {"raw_text": response.text}
+
+    print("NEWS STATUS:", response.status_code)
+    print("NEWS RAW RESPONSE:", data)
+
+    if response.status_code != 200:
+        raise RuntimeError(f"News API error: {data}")
 
     if data.get("status") != "ok":
-        raise RuntimeError(f"News API error: {data}")
+        raise RuntimeError(f"News API returned bad status: {data}")
 
     articles = []
     seen_titles = set()
@@ -75,7 +76,7 @@ def fetch_ai_news():
     return articles[:3]
 
 
-def format_message(articles):
+def format_message(articles: list[dict]) -> str:
     lines = [
         "<b>AI news digest</b>",
         "",
@@ -85,38 +86,44 @@ def format_message(articles):
         title = html.escape(article["title"])
         source = html.escape(article["source"])
         url = html.escape(article["url"])
-        description = html.escape(article["description"][:200]) if article["description"] else ""
+        description = html.escape(article["description"][:220]) if article["description"] else ""
 
         lines.append(f"{index}. <b>{title}</b>")
         lines.append(f"Source: {source}")
-
         if description:
             lines.append(description)
-
         lines.append(f'<a href="{url}">Read more</a>')
         lines.append("")
 
     lines.append("#AI #news")
-
     return "\n".join(lines)
 
 
-def send_to_telegram(text):
+def send_to_telegram(bot_token: str, chat_id: str, text: str) -> dict:
+    telegram_send_url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+
     payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
+        "chat_id": chat_id,
         "text": text,
         "parse_mode": "HTML",
         "disable_web_page_preview": False,
     }
 
-    response = requests.post(TELEGRAM_SEND_URL, json=payload, timeout=30)
-    response.raise_for_status()
+    response = requests.post(telegram_send_url, json=payload, timeout=30)
 
-    data = response.json()
+    try:
+        data = response.json()
+    except Exception:
+        data = {"raw_text": response.text}
+
+    print("TELEGRAM STATUS:", response.status_code)
     print("TELEGRAM RAW RESPONSE:", data)
 
-    if not data.get("ok"):
+    if response.status_code != 200:
         raise RuntimeError(f"Telegram API error: {data}")
+
+    if not data.get("ok"):
+        raise RuntimeError(f"Telegram API returned bad status: {data}")
 
     return data
 
@@ -129,19 +136,24 @@ def home():
     })
 
 
+@app.get("/health")
+def health():
+    return jsonify({"ok": True})
+
+
 @app.get("/run")
 def run_bot():
-    key = request.args.get("key", "")
-
-    if key != RUN_SECRET:
-        return jsonify({
-            "ok": False,
-            "error": "unauthorized"
-        }), 401
-
     try:
-        validate_env()
-        articles = fetch_ai_news()
+        config = get_config()
+
+        key = request.args.get("key", "").strip()
+        if key != config["RUN_SECRET"]:
+            return jsonify({
+                "ok": False,
+                "error": "unauthorized"
+            }), 401
+
+        articles = fetch_ai_news(config["NEWS_API_KEY"])
 
         if not articles:
             return jsonify({
@@ -151,20 +163,26 @@ def run_bot():
             })
 
         message = format_message(articles)
-        telegram_result = send_to_telegram(message)
+        telegram_result = send_to_telegram(
+            config["TELEGRAM_BOT_TOKEN"],
+            config["TELEGRAM_CHAT_ID"],
+            message,
+        )
 
         return jsonify({
             "ok": True,
             "posted": len(articles),
             "articles": articles,
-            "telegram_result": telegram_result
+            "telegram_result": telegram_result,
         })
 
     except Exception as e:
-        print("ERROR:", str(e))
+        tb = traceback.format_exc()
+        print("ERROR:", tb)
         return jsonify({
             "ok": False,
-            "error": str(e)
+            "error": str(e),
+            "traceback": tb,
         }), 500
 
 
